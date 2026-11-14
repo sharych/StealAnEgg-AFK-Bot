@@ -1,0 +1,12 @@
+# Binaries & Build Outputs
+*.exe
+*.app/
+*.zip
+macos/build/
+windows/bin/
+windows/obj/
+
+# macOS / Windows OS Files
+.DS_Store
+Thumbs.db
+desktop.ini
