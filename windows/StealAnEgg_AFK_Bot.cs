@@ -141,7 +141,7 @@ public class MainForm : Form
 
     private void InitializeComponents()
     {
-        this.Text = "Steal an Egg - Smart AFK Fishing & Treadmill Bot (v5.0)";
+        this.Text = "Steal an Egg - Smart AFK Fishing & Treadmill Bot (v5.1)";
         this.Size = new Size(680, 760);
         this.StartPosition = FormStartPosition.CenterScreen;
         this.FormBorderStyle = FormBorderStyle.FixedDialog;
@@ -279,7 +279,7 @@ public class MainForm : Form
 
         y += 48;
         Label lblSyncNote = new Label();
-        lblSyncNote.Text = "v5.0 Preset Defaults Locked In:\n- Timeout: 9.00s | Max Clicks: 48 | Click Speed: 30ms | Post-Catch: 2.50s | 2x Glitch: ON (9 & 3)\n- Press F6 for AFK Fishing, or stand on Treadmill and press F8 for Treadmill Camera Anti-AFK!";
+        lblSyncNote.Text = "v5.1 Preset Defaults Locked In (Auto-Saved):\n- Timeout: 9.00s | Max Clicks: 48 | Click Speed: 30ms | Post-Catch: 2.50s | 2x Glitch: ON (9 & 3)\n- Press F6 for AFK Fishing, or stand on Treadmill and press F8 for Treadmill Camera Anti-AFK!";
         lblSyncNote.ForeColor = Color.FromArgb(166, 227, 161);
         lblSyncNote.Location = new Point(20, y);
         lblSyncNote.Size = new Size(585, 65);
@@ -450,7 +450,7 @@ public class MainForm : Form
         };
         radarTimer.Start();
 
-        Log("Bot v5.0 ready! Press F6 for Fishing Bot (with your saved defaults), or F8 for Treadmill Camera AFK.");
+        Log("Bot v5.1 ready! Press F6 for Fishing Bot (with your saved settings), or F8 for Treadmill Camera AFK.");
     }
 
     private void AddLabel(Control parent, string text, int x, int y)

@@ -1,4 +1,4 @@
-# Steal an Egg — Smart AFK Fishing & Treadmill Bot (v5.0)
+# Steal an Egg — Smart AFK Fishing & Treadmill Bot (v5.1)
 
 [![Release Build](https://github.com/sharych/StealAnEgg-AFK-Bot/actions/workflows/release.yml/badge.svg)](https://github.com/sharych/StealAnEgg-AFK-Bot/actions/workflows/release.yml)
 

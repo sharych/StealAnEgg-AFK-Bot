@@ -300,7 +300,7 @@ final class BotAppController: NSObject, NSApplicationDelegate, NSWindowDelegate,
         registerGlobalHotkeys()
         startTimers()
         checkPermissionsOnLaunch()
-        log("Bot v5.0 (macOS) ready! Press F6 for Fishing Bot or F8 for Treadmill Camera AFK.")
+        log("Bot v5.1 (macOS) ready! Press F6 for Fishing Bot or F8 for Treadmill Camera AFK.")
     }
 
     func applicationShouldTerminateAfterLastWindowClosed(_ sender: NSApplication) -> Bool {
@@ -352,7 +352,7 @@ final class BotAppController: NSObject, NSApplicationDelegate, NSWindowDelegate,
             backing: .buffered,
             defer: false
         )
-        window.title = "Steal an Egg - Smart AFK Fishing & Treadmill Bot (macOS v5.0)"
+        window.title = "Steal an Egg - Smart AFK Fishing & Treadmill Bot (macOS v5.1)"
         window.center()
         window.delegate = self
 
