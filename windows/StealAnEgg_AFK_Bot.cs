@@ -1,6 +1,8 @@
 using System;
 using System.Drawing;
 using System.Drawing.Imaging;
+using System.Globalization;
+using System.IO;
 using System.Media;
 using System.Runtime.InteropServices;
 using System.Threading;
@@ -39,6 +41,33 @@ public class MainForm : Form
     private const uint VK_F7 = 0x76;
     private const uint VK_F8 = 0x77;
 
+    private enum BotMode
+    {
+        Idle,
+        Fishing,
+        Treadmill
+    }
+
+    private struct BotSettings
+    {
+        public double TimeoutSec;
+        public int MaxClicks;
+        public int ClickSpeedMs;
+        public double PostCatchWaitSec;
+        public int CastX;
+        public int CastY;
+        public double CastHoldSec;
+        public bool Enable2xGlitch;
+        public string RodKey;
+        public string SwapKey;
+        public bool Randomize;
+        public bool EnableAntiAfk;
+        public int CamMinSec;
+        public int CamMaxSec;
+        public int CamDragPx;
+        public bool CamArrowAssist;
+    }
+
     // ================= GUI Controls =================
     private Button btnToggleFishing;
     private Button btnToggleTreadmill;
@@ -75,14 +104,26 @@ public class MainForm : Form
     private Button btnTestCamRotate;
 
     // ================= Thread-Safe State =================
-    private volatile bool isRunning = false;
+    private readonly object stateLock = new object();
+    private bool _isRunning = false;
+    private long _runGeneration = 0;
+    private BotMode _activeMode = BotMode.Idle;
+    private bool _isTestClicking = false;
+
+    private readonly object settingsLock = new object();
+    private BotSettings cachedSettings;
+    private bool isLoadingSettings = false;
+
+    private readonly object randLock = new object();
+    private Random rand = new Random();
+
     private Thread botThread = null;
     private DateTime startTime;
+    private DateTime lastRadarUiUpdate = DateTime.MinValue;
     private System.Windows.Forms.Timer uiTimer;
     private System.Windows.Forms.Timer radarTimer;
     private int fishCaught = 0;
     private int camRotationsDone = 0;
-    private Random rand = new Random();
 
     // Thread-safe lock for screen capture
     private static readonly object radarLock = new object();
@@ -92,6 +133,9 @@ public class MainForm : Form
     public MainForm()
     {
         InitializeComponents();
+        LoadSettingsFromDisk();
+        HookSettingsEvents();
+        SyncSettingsFromUI(false);
         RegisterGlobalHotkeys();
     }
 
@@ -246,9 +290,9 @@ public class MainForm : Form
         AddLabel(tabCasting, "Cast Aim Coordinates (Water target):", 20, y);
         y += 25;
         AddLabel(tabCasting, "X:", 20, y + 3);
-        numCastX = CreateNum(tabCasting, 45, y, 0, 3840, 1138);
+        numCastX = CreateNum(tabCasting, 45, y, -10000, 10000, 1138);
         AddLabel(tabCasting, "Y:", 140, y + 3);
-        numCastY = CreateNum(tabCasting, 165, y, 0, 2160, 362);
+        numCastY = CreateNum(tabCasting, 165, y, -10000, 10000, 362);
 
         btnPickCast = new Button();
         btnPickCast.Text = "Pick Point (3s Countdown)";
@@ -335,9 +379,11 @@ public class MainForm : Form
         btnTestCamRotate.Font = new Font("Segoe UI", 9.25f, FontStyle.Bold);
         btnTestCamRotate.Click += delegate {
             Log("Switch to Roblox! Testing smooth camera rotation in 2 seconds...");
+            SyncSettingsFromUI(true);
+            BotSettings snap = GetCurrentSettings();
             Thread t = new Thread(delegate() {
                 Thread.Sleep(2000);
-                PerformSmoothCameraRotate();
+                PerformSmoothCameraRotate(snap, null);
             });
             t.IsBackground = true;
             t.Start();
@@ -384,9 +430,9 @@ public class MainForm : Form
         uiTimer = new System.Windows.Forms.Timer();
         uiTimer.Interval = 1000;
         uiTimer.Tick += delegate {
-            if (isRunning) {
+            if (IsBotRunning()) {
                 TimeSpan elapsed = DateTime.Now - startTime;
-                lblElapsedTime.Text = string.Format("Elapsed Time: {0:D2}:{1:D2}:{2:D2}", 
+                lblElapsedTime.Text = string.Format("Elapsed Time: {0:D2}:{1:D2}:{2:D2}",
                     (int)elapsed.TotalHours, elapsed.Minutes, elapsed.Seconds);
             }
         };
@@ -396,15 +442,11 @@ public class MainForm : Form
         radarTimer = new System.Windows.Forms.Timer();
         radarTimer.Interval = 250;
         radarTimer.Tick += delegate {
+            if (GetActiveMode() == BotMode.Fishing) return;
             int redCount = 0;
-            bool isBite = ScanForStopButtonFast(out redCount);
-            if (isBite) {
-                lblRadar.Text = string.Format("Radar Status: [MINIGAME STOP BUTTON DETECTED! ({0} red px)]", redCount);
-                lblRadar.ForeColor = Color.FromArgb(166, 227, 161);
-            } else {
-                lblRadar.Text = string.Format("Radar Status: Waiting for bite ({0} red px in scan zone)", redCount);
-                lblRadar.ForeColor = Color.FromArgb(148, 226, 213);
-            }
+            int threshold = 40;
+            bool isBite = ScanForStopButtonFast(out redCount, out threshold);
+            UpdateRadarLabel(isBite, redCount, true);
         };
         radarTimer.Start();
 
@@ -459,75 +501,355 @@ public class MainForm : Form
             cdTimer.Stop();
             cdTimer.Dispose();
             Point cur = Cursor.Position;
-            targetX.Value = cur.X;
-            targetY.Value = cur.Y;
+            decimal clampedX = Math.Max(targetX.Minimum, Math.Min(targetX.Maximum, (decimal)cur.X));
+            decimal clampedY = Math.Max(targetY.Minimum, Math.Min(targetY.Maximum, (decimal)cur.Y));
+            targetX.Value = clampedX;
+            targetY.Value = clampedY;
+            SyncSettingsFromUI(true);
             SystemSounds.Beep.Play();
-            Log(string.Format("Picked {0}: X={1}, Y={2}", name, cur.X, cur.Y));
+            Log(string.Format("Picked {0}: X={1}, Y={2} (Saved)", name, (int)clampedX, (int)clampedY));
         };
         cdTimer.Start();
     }
 
-    // ================= Smooth Right-Click Camera Rotation (Safe for Treadmill & Fishing) =================
-    private void PerformSmoothCameraRotate()
+    // ================= Settings Persistence & Thread-Safe Access =================
+    private static string GetSettingsFilePath()
+    {
+        string appData = Environment.GetFolderPath(Environment.SpecialFolder.ApplicationData);
+        return Path.Combine(Path.Combine(appData, "StealAnEgg_AFK_Bot"), "settings.cfg");
+    }
+
+    private void HookSettingsEvents()
+    {
+        EventHandler onChanged = delegate {
+            if (!isLoadingSettings)
+            {
+                SyncSettingsFromUI(true);
+            }
+        };
+
+        numCastX.ValueChanged += onChanged;
+        numCastY.ValueChanged += onChanged;
+        numCastHold.ValueChanged += onChanged;
+        chk2xGlitch.CheckedChanged += onChanged;
+        txtRodKey.TextChanged += onChanged;
+        txtSwapKey.TextChanged += onChanged;
+
+        numTimeout.ValueChanged += onChanged;
+        numClicksCount.ValueChanged += onChanged;
+        numClickSpeedMs.ValueChanged += onChanged;
+        numPostCatchWait.ValueChanged += onChanged;
+
+        chkRandomize.CheckedChanged += onChanged;
+        chkAntiAfk.CheckedChanged += onChanged;
+        numCamMinSec.ValueChanged += onChanged;
+        numCamMaxSec.ValueChanged += onChanged;
+        numCamDragPx.ValueChanged += onChanged;
+        chkCamArrowAssist.CheckedChanged += onChanged;
+    }
+
+    private BotSettings ReadSettingsFromUI()
+    {
+        BotSettings s = new BotSettings();
+        s.TimeoutSec = (double)numTimeout.Value;
+        s.MaxClicks = (int)numClicksCount.Value;
+        s.ClickSpeedMs = (int)numClickSpeedMs.Value;
+        s.PostCatchWaitSec = (double)numPostCatchWait.Value;
+        s.CastX = (int)numCastX.Value;
+        s.CastY = (int)numCastY.Value;
+        s.CastHoldSec = (double)numCastHold.Value;
+        s.Enable2xGlitch = chk2xGlitch.Checked;
+        s.RodKey = string.IsNullOrEmpty(txtRodKey.Text) ? "9" : txtRodKey.Text.Trim();
+        s.SwapKey = string.IsNullOrEmpty(txtSwapKey.Text) ? "3" : txtSwapKey.Text.Trim();
+        s.Randomize = chkRandomize.Checked;
+        s.EnableAntiAfk = chkAntiAfk.Checked;
+        s.CamMinSec = (int)numCamMinSec.Value;
+        s.CamMaxSec = (int)numCamMaxSec.Value;
+        s.CamDragPx = (int)numCamDragPx.Value;
+        s.CamArrowAssist = chkCamArrowAssist.Checked;
+        return s;
+    }
+
+    private BotSettings GetCurrentSettings()
+    {
+        lock (settingsLock)
+        {
+            return cachedSettings;
+        }
+    }
+
+    private void SyncSettingsFromUI(bool save)
+    {
+        BotSettings s = ReadSettingsFromUI();
+        lock (settingsLock)
+        {
+            cachedSettings = s;
+        }
+        if (save)
+        {
+            SaveSettingsToDisk(s);
+        }
+    }
+
+    private static void SetNumClamped(NumericUpDown ctrl, decimal val)
+    {
+        if (val < ctrl.Minimum) val = ctrl.Minimum;
+        if (val > ctrl.Maximum) val = ctrl.Maximum;
+        ctrl.Value = val;
+    }
+
+    private void SaveSettingsToDisk(BotSettings s)
     {
         try
         {
+            string path = GetSettingsFilePath();
+            string dir = Path.GetDirectoryName(path);
+            if (!Directory.Exists(dir)) Directory.CreateDirectory(dir);
+
+            string[] lines = new string[] {
+                "timeoutSec=" + s.TimeoutSec.ToString("F2", CultureInfo.InvariantCulture),
+                "maxClicks=" + s.MaxClicks.ToString(CultureInfo.InvariantCulture),
+                "clickSpeedMs=" + s.ClickSpeedMs.ToString(CultureInfo.InvariantCulture),
+                "postCatchWaitSec=" + s.PostCatchWaitSec.ToString("F2", CultureInfo.InvariantCulture),
+                "castX=" + s.CastX.ToString(CultureInfo.InvariantCulture),
+                "castY=" + s.CastY.ToString(CultureInfo.InvariantCulture),
+                "castHoldSec=" + s.CastHoldSec.ToString("F2", CultureInfo.InvariantCulture),
+                "enable2xGlitch=" + (s.Enable2xGlitch ? "1" : "0"),
+                "rodKey=" + s.RodKey,
+                "swapKey=" + s.SwapKey,
+                "randomize=" + (s.Randomize ? "1" : "0"),
+                "enableAntiAfk=" + (s.EnableAntiAfk ? "1" : "0"),
+                "camMinSec=" + s.CamMinSec.ToString(CultureInfo.InvariantCulture),
+                "camMaxSec=" + s.CamMaxSec.ToString(CultureInfo.InvariantCulture),
+                "camDragPx=" + s.CamDragPx.ToString(CultureInfo.InvariantCulture),
+                "camArrowAssist=" + (s.CamArrowAssist ? "1" : "0")
+            };
+            File.WriteAllLines(path, lines);
+        }
+        catch
+        {
+        }
+    }
+
+    private void LoadSettingsFromDisk()
+    {
+        try
+        {
+            string path = GetSettingsFilePath();
+            if (!File.Exists(path)) return;
+
+            isLoadingSettings = true;
+            string[] lines = File.ReadAllLines(path);
+            for (int i = 0; i < lines.Length; i++)
+            {
+                string line = lines[i];
+                int eq = line.IndexOf('=');
+                if (eq <= 0) continue;
+                string key = line.Substring(0, eq).Trim();
+                string val = line.Substring(eq + 1).Trim();
+
+                decimal decVal;
+                int intVal;
+                if (key == "timeoutSec" && decimal.TryParse(val, NumberStyles.Any, CultureInfo.InvariantCulture, out decVal))
+                    SetNumClamped(numTimeout, decVal);
+                else if (key == "maxClicks" && int.TryParse(val, NumberStyles.Integer, CultureInfo.InvariantCulture, out intVal))
+                    SetNumClamped(numClicksCount, intVal);
+                else if (key == "clickSpeedMs" && int.TryParse(val, NumberStyles.Integer, CultureInfo.InvariantCulture, out intVal))
+                    SetNumClamped(numClickSpeedMs, intVal);
+                else if (key == "postCatchWaitSec" && decimal.TryParse(val, NumberStyles.Any, CultureInfo.InvariantCulture, out decVal))
+                    SetNumClamped(numPostCatchWait, decVal);
+                else if (key == "castX" && int.TryParse(val, NumberStyles.Integer, CultureInfo.InvariantCulture, out intVal))
+                    SetNumClamped(numCastX, intVal);
+                else if (key == "castY" && int.TryParse(val, NumberStyles.Integer, CultureInfo.InvariantCulture, out intVal))
+                    SetNumClamped(numCastY, intVal);
+                else if (key == "castHoldSec" && decimal.TryParse(val, NumberStyles.Any, CultureInfo.InvariantCulture, out decVal))
+                    SetNumClamped(numCastHold, decVal);
+                else if (key == "enable2xGlitch")
+                    chk2xGlitch.Checked = (val == "1" || val.Equals("true", StringComparison.OrdinalIgnoreCase));
+                else if (key == "rodKey" && !string.IsNullOrEmpty(val))
+                    txtRodKey.Text = val;
+                else if (key == "swapKey" && !string.IsNullOrEmpty(val))
+                    txtSwapKey.Text = val;
+                else if (key == "randomize")
+                    chkRandomize.Checked = (val == "1" || val.Equals("true", StringComparison.OrdinalIgnoreCase));
+                else if (key == "enableAntiAfk")
+                    chkAntiAfk.Checked = (val == "1" || val.Equals("true", StringComparison.OrdinalIgnoreCase));
+                else if (key == "camMinSec" && int.TryParse(val, NumberStyles.Integer, CultureInfo.InvariantCulture, out intVal))
+                    SetNumClamped(numCamMinSec, intVal);
+                else if (key == "camMaxSec" && int.TryParse(val, NumberStyles.Integer, CultureInfo.InvariantCulture, out intVal))
+                    SetNumClamped(numCamMaxSec, intVal);
+                else if (key == "camDragPx" && int.TryParse(val, NumberStyles.Integer, CultureInfo.InvariantCulture, out intVal))
+                    SetNumClamped(numCamDragPx, intVal);
+                else if (key == "camArrowAssist")
+                    chkCamArrowAssist.Checked = (val == "1" || val.Equals("true", StringComparison.OrdinalIgnoreCase));
+            }
+        }
+        catch
+        {
+        }
+        finally
+        {
+            isLoadingSettings = false;
+        }
+    }
+
+    private int NextRand(int minInclusive, int maxExclusive)
+    {
+        lock (randLock)
+        {
+            return rand.Next(minInclusive, maxExclusive);
+        }
+    }
+
+    private bool IsBotRunning()
+    {
+        lock (stateLock)
+        {
+            return _isRunning;
+        }
+    }
+
+    private BotMode GetActiveMode()
+    {
+        lock (stateLock)
+        {
+            return _activeMode;
+        }
+    }
+
+    private bool IsActiveRun(long runId)
+    {
+        lock (stateLock)
+        {
+            return _isRunning && _runGeneration == runId;
+        }
+    }
+
+    private bool SleepInterruptibly(int ms, long runId)
+    {
+        if (ms <= 0) return IsActiveRun(runId);
+        DateTime deadline = DateTime.UtcNow.AddMilliseconds(ms);
+        while (IsActiveRun(runId))
+        {
+            double remainingMs = (deadline - DateTime.UtcNow).TotalMilliseconds;
+            if (remainingMs <= 0) return true;
+            int slice = remainingMs > 40 ? 40 : (int)Math.Ceiling(remainingMs);
+            if (slice > 0) Thread.Sleep(slice);
+        }
+        return false;
+    }
+
+    // ================= Smooth Right-Click Camera Rotation (Safe for Treadmill & Fishing) =================
+    private void PerformSmoothCameraRotate(BotSettings settings, long? runId)
+    {
+        bool rightDown = false;
+        try
+        {
+            if (runId.HasValue && !IsActiveRun(runId.Value)) return;
+
             Rectangle screen = Screen.PrimaryScreen.Bounds;
-            int safeX = screen.Width / 2 + rand.Next(-40, 41);
-            int safeY = (int)(screen.Height * 0.38) + rand.Next(-25, 26);
+            int safeX = screen.Width / 2 + NextRand(-40, 41);
+            int safeY = (int)(screen.Height * 0.38) + NextRand(-25, 26);
 
             Cursor.Position = new Point(safeX, safeY);
-            Thread.Sleep(60);
-
-            int totalPixels = (int)numCamDragPx.Value;
-            if (chkRandomize.Checked)
+            if (runId.HasValue)
             {
-                totalPixels += rand.Next(-25, 35);
+                if (!SleepInterruptibly(60, runId.Value)) return;
+            }
+            else
+            {
+                Thread.Sleep(60);
+            }
+
+            int totalPixels = settings.CamDragPx;
+            if (settings.Randomize)
+            {
+                totalPixels += NextRand(-25, 35);
                 if (totalPixels < 40) totalPixels = 40;
             }
 
             // Randomly pick initial direction (Left = -1, Right = +1)
-            int dir = (rand.Next(0, 2) == 0) ? 1 : -1;
+            int dir = (NextRand(0, 2) == 0) ? 1 : -1;
             int steps = 16;
             int stepDx = (totalPixels / steps) * dir;
-            int stepDy = rand.Next(-1, 2);
+            int stepDy = NextRand(-1, 2);
 
             // Hold Right Mouse Button to rotate camera in Roblox
             mouse_event(MOUSEEVENTF_RIGHTDOWN, 0, 0, 0, 0);
-            Thread.Sleep(55);
+            rightDown = true;
 
-            // Smoothly drag camera out
+            if (runId.HasValue)
+            {
+                if (!SleepInterruptibly(55, runId.Value)) return;
+            }
+            else
+            {
+                Thread.Sleep(55);
+            }
+
+            // Smoothly drag camera out using relative mouse_event deltas only
+            int walkedSteps = 0;
             for (int i = 0; i < steps; i++)
             {
+                if (runId.HasValue && !IsActiveRun(runId.Value)) break;
                 mouse_event(MOUSEEVENTF_MOVE, stepDx, stepDy, 0, 0);
-                Cursor.Position = new Point(Cursor.Position.X + stepDx, Cursor.Position.Y + stepDy);
-                Thread.Sleep(14);
+                walkedSteps++;
+                if (runId.HasValue)
+                {
+                    if (!SleepInterruptibly(14, runId.Value)) break;
+                }
+                else
+                {
+                    Thread.Sleep(14);
+                }
             }
 
             // Brief human pause at peak of camera look
-            Thread.Sleep(rand.Next(120, 260));
+            if (!runId.HasValue || IsActiveRun(runId.Value))
+            {
+                int pauseMs = NextRand(120, 260);
+                if (runId.HasValue) SleepInterruptibly(pauseMs, runId.Value);
+                else Thread.Sleep(pauseMs);
+            }
 
             // Smoothly return camera back to original center angle so view never drifts
-            for (int i = 0; i < steps; i++)
+            for (int i = 0; i < walkedSteps; i++)
             {
                 mouse_event(MOUSEEVENTF_MOVE, -stepDx, -stepDy, 0, 0);
-                Cursor.Position = new Point(Cursor.Position.X - stepDx, Cursor.Position.Y - stepDy);
                 Thread.Sleep(14);
             }
 
             Thread.Sleep(45);
             mouse_event(MOUSEEVENTF_RIGHTUP, 0, 0, 0, 0);
+            rightDown = false;
+
+            if (runId.HasValue && !IsActiveRun(runId.Value)) return;
 
             // Optional Left/Right arrow camera nudge (rotates Roblox camera without walking/stepping off treadmill)
-            if (chkCamArrowAssist.Checked)
+            if (settings.CamArrowAssist)
             {
-                Thread.Sleep(80);
+                if (runId.HasValue)
+                {
+                    if (!SleepInterruptibly(80, runId.Value)) return;
+                }
+                else
+                {
+                    Thread.Sleep(80);
+                }
+
                 byte firstArrow = (dir > 0) ? (byte)Keys.Right : (byte)Keys.Left;
                 byte secondArrow = (dir > 0) ? (byte)Keys.Left : (byte)Keys.Right;
-                int arrowHold = rand.Next(85, 140);
+                int arrowHold = NextRand(85, 140);
 
                 SimulateKeyPress(firstArrow, arrowHold);
-                Thread.Sleep(90);
+                if (runId.HasValue)
+                {
+                    if (!SleepInterruptibly(90, runId.Value)) return;
+                }
+                else
+                {
+                    Thread.Sleep(90);
+                }
                 SimulateKeyPress(secondArrow, arrowHold);
             }
 
@@ -539,52 +861,103 @@ public class MainForm : Form
         {
             Log("Camera rotate error: " + ex.Message);
         }
+        finally
+        {
+            if (rightDown)
+            {
+                mouse_event(MOUSEEVENTF_RIGHTUP, 0, 0, 0, 0);
+            }
+        }
     }
 
-    private int GetNextCameraIntervalSec()
+    private int GetNextCameraIntervalSec(BotSettings settings)
     {
-        int minS = (int)numCamMinSec.Value;
-        int maxS = (int)numCamMaxSec.Value;
+        int minS = settings.CamMinSec;
+        int maxS = settings.CamMaxSec;
         if (maxS < minS) maxS = minS;
-        return rand.Next(minS, maxS + 1);
+        return NextRand(minS, maxS + 1);
     }
 
     // ================= Instant Test Clicks (Zero Delay) =================
     private void DoTurboClickTest()
     {
-        Log("Sending 20 TURBO clicks instantly right now!");
-        for (int i = 0; i < 20; i++)
+        lock (stateLock)
         {
-            mouse_event(MOUSEEVENTF_LEFTDOWN, 0, 0, 0, 0);
-            Thread.Sleep(10);
-            mouse_event(MOUSEEVENTF_LEFTUP, 0, 0, 0, 0);
-            Thread.Sleep(18);
+            if (_isTestClicking) return;
+            _isTestClicking = true;
         }
-        SystemSounds.Asterisk.Play();
-        Log("20 Turbo clicks finished!");
+
+        Log("Sending 20 TURBO clicks instantly right now!");
+        Thread t = new Thread(delegate() {
+            try
+            {
+                for (int i = 0; i < 20; i++)
+                {
+                    mouse_event(MOUSEEVENTF_LEFTDOWN, 0, 0, 0, 0);
+                    Thread.Sleep(10);
+                    mouse_event(MOUSEEVENTF_LEFTUP, 0, 0, 0, 0);
+                    Thread.Sleep(18);
+                }
+                SystemSounds.Asterisk.Play();
+                Log("20 Turbo clicks finished!");
+            }
+            finally
+            {
+                lock (stateLock)
+                {
+                    _isTestClicking = false;
+                }
+            }
+        });
+        t.IsBackground = true;
+        t.Start();
     }
 
     private void TestRadarNow()
     {
         int redCount = 0;
-        bool detected = ScanForStopButtonFast(out redCount);
-        string msg = string.Format("Radar Scan:\nSTOP Button Detected: {0}\nRed Pixels: {1} (Threshold: 40)\nScreen: {2}x{3}",
+        int threshold = 40;
+        bool detected = ScanForStopButtonFast(out redCount, out threshold);
+        string msg = string.Format("Radar Scan:\nSTOP Button Detected: {0}\nRed Pixels: {1} (Threshold: {2})\nScreen: {3}x{4}",
             detected ? "YES! (Minigame Active)" : "NO (Waiting / Normal Gameplay)",
             redCount,
+            threshold,
             Screen.PrimaryScreen.Bounds.Width,
             Screen.PrimaryScreen.Bounds.Height);
         Log(msg.Replace("\n", " | "));
         MessageBox.Show(msg, "Radar Test", MessageBoxButtons.OK, detected ? MessageBoxIcon.Information : MessageBoxIcon.Warning);
     }
 
+    private void UpdateRadarLabel(bool isBite, int redCount, bool force)
+    {
+        DateTime now = DateTime.UtcNow;
+        if (!force && (now - lastRadarUiUpdate).TotalMilliseconds < 250) return;
+        lastRadarUiUpdate = now;
+
+        InvokeAction(delegate {
+            if (isBite)
+            {
+                lblRadar.Text = string.Format("Radar Status: [MINIGAME STOP BUTTON DETECTED! ({0} red px)]", redCount);
+                lblRadar.ForeColor = Color.FromArgb(166, 227, 161);
+            }
+            else
+            {
+                lblRadar.Text = string.Format("Radar Status: Waiting for bite ({0} red px in scan zone)", redCount);
+                lblRadar.ForeColor = Color.FromArgb(148, 226, 213);
+            }
+        });
+    }
+
     // ================= Thread-Safe High-Precision STOP Button Radar =================
-    private static bool ScanForStopButtonFast(out int redPixelCount)
+    private static bool ScanForStopButtonFast(out int redPixelCount, out int threshold)
     {
         redPixelCount = 0;
+        threshold = 40;
         lock (radarLock)
         {
             try
             {
+                if (radarBmp == null || radarGraphics == null) return false;
                 Rectangle screen = Screen.PrimaryScreen.Bounds;
                 int minX = (int)(screen.Width * 0.65);
                 int maxX = (int)(screen.Width * 0.85);
@@ -594,6 +967,9 @@ public class MainForm : Form
                 int width = maxX - minX;
                 int height = maxY - minY;
                 if (width <= 0 || height <= 0) return false;
+
+                int sampledPixels = Math.Max(1, ((width + 2) / 3) * ((height + 2) / 3));
+                threshold = Math.Min(50, Math.Max(18, (int)Math.Round(sampledPixels * (40.0 / 6912.0))));
 
                 if (radarBmp.Width != width || radarBmp.Height != height)
                 {
@@ -628,7 +1004,7 @@ public class MainForm : Form
                         }
                     }
                 }
-                return (redPixelCount >= 40);
+                return (redPixelCount >= threshold);
             }
             catch
             {
@@ -640,7 +1016,7 @@ public class MainForm : Form
     // ================= Mode Toggles =================
     private void ToggleFishingBot()
     {
-        if (isRunning)
+        if (IsBotRunning())
         {
             StopAllBots();
         }
@@ -652,7 +1028,7 @@ public class MainForm : Form
 
     private void ToggleTreadmillBot()
     {
-        if (isRunning)
+        if (IsBotRunning())
         {
             StopAllBots();
         }
@@ -662,50 +1038,73 @@ public class MainForm : Form
         }
     }
 
+    private long BeginRun(BotMode mode)
+    {
+        lock (stateLock)
+        {
+            if (_isRunning) return 0;
+            _isRunning = true;
+            _activeMode = mode;
+            _runGeneration++;
+            return _runGeneration;
+        }
+    }
+
     private void StartFishingBot()
     {
-        if (isRunning) return;
-        isRunning = true;
+        SyncSettingsFromUI(true);
+        long runId = BeginRun(BotMode.Fishing);
+        if (runId == 0) return;
+
         startTime = DateTime.Now;
 
         btnToggleFishing.Text = "STOP FISHING (F6)";
         btnToggleFishing.BackColor = Color.FromArgb(243, 139, 168);
         btnToggleTreadmill.Enabled = false;
+        lblFishCount.Text = string.Format("Fish Caught: {0}", fishCaught);
         lblStatus.Text = "STATUS: FISHING RUNNING (Press F6 to Stop)";
         lblStatus.ForeColor = Color.FromArgb(166, 227, 161);
 
         Log("Fishing Bot STARTED! Casting in 1.5s...");
         SystemSounds.Asterisk.Play();
 
-        botThread = new Thread(FishingBotLoop);
+        botThread = new Thread(delegate() { FishingBotLoop(runId); });
         botThread.IsBackground = true;
         botThread.Start();
     }
 
     private void StartTreadmillBot()
     {
-        if (isRunning) return;
-        isRunning = true;
+        SyncSettingsFromUI(true);
+        long runId = BeginRun(BotMode.Treadmill);
+        if (runId == 0) return;
+
         startTime = DateTime.Now;
 
         btnToggleTreadmill.Text = "STOP TREADMILL (F8)";
         btnToggleTreadmill.BackColor = Color.FromArgb(243, 139, 168);
         btnToggleFishing.Enabled = false;
+        lblFishCount.Text = string.Format("Cam Rotates: {0}", camRotationsDone);
         lblStatus.Text = "STATUS: TREADMILL AFK RUNNING (Press F8 to Stop)";
         lblStatus.ForeColor = Color.FromArgb(137, 180, 250);
 
         Log("Treadmill Speed AFK Mode STARTED! Make sure your character is running on the treadmill.");
         SystemSounds.Asterisk.Play();
 
-        botThread = new Thread(TreadmillBotLoop);
+        botThread = new Thread(delegate() { TreadmillBotLoop(runId); });
         botThread.IsBackground = true;
         botThread.Start();
     }
 
     private void StopAllBots()
     {
-        if (!isRunning) return;
-        isRunning = false;
+        lock (stateLock)
+        {
+            if (!_isRunning) return;
+            _isRunning = false;
+            _activeMode = BotMode.Idle;
+            _runGeneration++;
+        }
 
         btnToggleFishing.Text = "START FISHING (F6)";
         btnToggleFishing.BackColor = Color.FromArgb(166, 227, 161);
@@ -723,43 +1122,47 @@ public class MainForm : Form
     }
 
     // ================= Dedicated Treadmill Speed AFK Loop =================
-    private void TreadmillBotLoop()
+    private void TreadmillBotLoop(long runId)
     {
-        Thread.Sleep(2000);
+        if (!SleepInterruptibly(2000, runId)) return;
 
         // Perform an initial gentle camera check so the user immediately sees it working
-        if (isRunning)
+        if (IsActiveRun(runId))
         {
             InvokeAction(delegate {
                 lblStatus.Text = "STATUS: Treadmill Mode - Rotating Camera...";
                 lblStatus.ForeColor = Color.FromArgb(166, 227, 161);
             });
-            PerformSmoothCameraRotate();
+            PerformSmoothCameraRotate(GetCurrentSettings(), runId);
+            InvokeAction(delegate {
+                lblFishCount.Text = string.Format("Cam Rotates: {0}", camRotationsDone);
+            });
         }
 
-        while (isRunning)
+        while (IsActiveRun(runId))
         {
-            int waitSec = GetNextCameraIntervalSec();
+            BotSettings settings = GetCurrentSettings();
+            int waitSec = GetNextCameraIntervalSec(settings);
             Log(string.Format("Staying on treadmill (zero WASD). Next random camera rotate in {0} seconds...", waitSec));
 
             DateTime nextRotate = DateTime.Now.AddSeconds(waitSec);
-            while (isRunning && DateTime.Now < nextRotate)
+            while (IsActiveRun(runId) && DateTime.Now < nextRotate)
             {
-                int remaining = (int)Math.Ceiling((nextRotate - DateTime.Now).TotalSeconds);
+                int remaining = Math.Max(0, (int)Math.Ceiling((nextRotate - DateTime.Now).TotalSeconds));
                 InvokeAction(delegate {
                     lblStatus.Text = string.Format("STATUS: TREADMILL AFK (Next Camera Rotate in {0}s)", remaining);
                     lblStatus.ForeColor = Color.FromArgb(137, 180, 250);
                 });
-                Thread.Sleep(500);
+                SleepInterruptibly(500, runId);
             }
 
-            if (!isRunning) break;
+            if (!IsActiveRun(runId)) break;
 
             InvokeAction(delegate {
                 lblStatus.Text = "STATUS: Treadmill Mode - Rotating Camera...";
                 lblStatus.ForeColor = Color.FromArgb(166, 227, 161);
             });
-            PerformSmoothCameraRotate();
+            PerformSmoothCameraRotate(GetCurrentSettings(), runId);
             InvokeAction(delegate {
                 lblFishCount.Text = string.Format("Cam Rotates: {0}", camRotationsDone);
             });
@@ -767,79 +1170,88 @@ public class MainForm : Form
     }
 
     // ================= Fishing Bot Loop =================
-    private void FishingBotLoop()
+    private void FishingBotLoop(long runId)
     {
-        Thread.Sleep(1500);
+        if (!SleepInterruptibly(1500, runId)) return;
 
-        DateTime nextCameraAfk = DateTime.Now.AddSeconds(GetNextCameraIntervalSec());
+        DateTime nextCameraAfk = DateTime.Now.AddSeconds(GetNextCameraIntervalSec(GetCurrentSettings()));
 
-        while (isRunning)
+        while (IsActiveRun(runId))
         {
             try
             {
+                BotSettings settings = GetCurrentSettings();
+
                 // 0. If a minigame is ALREADY on screen right now, reel it in first!
                 int initialRed;
-                if (ScanForStopButtonFast(out initialRed))
+                int threshold;
+                bool initialDetected = ScanForStopButtonFast(out initialRed, out threshold);
+                UpdateRadarLabel(initialDetected, initialRed, false);
+                if (initialDetected)
                 {
-                    ReelInFish();
+                    ReelInFish(settings, runId);
                     continue;
                 }
 
                 // 1. Smooth Camera Rotate Anti-AFK Check (only while rod is uncast between casts)
-                if (chkAntiAfk.Checked && DateTime.Now >= nextCameraAfk)
+                if (settings.EnableAntiAfk && DateTime.Now >= nextCameraAfk)
                 {
                     InvokeAction(delegate {
                         lblStatus.Text = "STATUS: Anti-AFK Smooth Camera Rotate...";
                         lblStatus.ForeColor = Color.FromArgb(137, 220, 235);
                     });
-                    PerformSmoothCameraRotate();
-                    nextCameraAfk = DateTime.Now.AddSeconds(GetNextCameraIntervalSec());
-                    Thread.Sleep(350);
+                    PerformSmoothCameraRotate(settings, runId);
+                    nextCameraAfk = DateTime.Now.AddSeconds(GetNextCameraIntervalSec(settings));
+                    if (!SleepInterruptibly(350, runId)) break;
                 }
 
-                if (!isRunning) break;
+                if (!IsActiveRun(runId)) break;
 
                 // 2. Casting
+                double castHoldSec = settings.CastHoldSec;
                 InvokeAction(delegate {
-                    lblStatus.Text = "STATUS: Charging Cast (1.10s)...";
+                    lblStatus.Text = string.Format("STATUS: Charging Cast ({0:F2}s)...", castHoldSec);
                     lblStatus.ForeColor = Color.FromArgb(205, 214, 244);
                 });
 
-                if (chk2xGlitch.Checked)
+                if (settings.Enable2xGlitch)
                 {
-                    byte rodKey = GetVirtualKey(txtRodKey.Text, (byte)Keys.D9);
-                    byte swapKey = GetVirtualKey(txtSwapKey.Text, (byte)Keys.D3);
+                    byte rodKey = GetVirtualKey(settings.RodKey, (byte)Keys.D9);
+                    byte swapKey = GetVirtualKey(settings.SwapKey, (byte)Keys.D3);
 
                     SimulateKeyPress(rodKey, 50);
-                    Thread.Sleep(150);
+                    if (!SleepInterruptibly(150, runId)) break;
                     SimulateKeyPress(swapKey, 50);
-                    Thread.Sleep(1450);
+                    if (!SleepInterruptibly(1450, runId)) break;
                 }
 
-                if (!isRunning) break;
+                if (!IsActiveRun(runId)) break;
 
-                int targetX = (int)numCastX.Value;
-                int targetY = (int)numCastY.Value;
-                if (chkRandomize.Checked)
+                int targetX = settings.CastX;
+                int targetY = settings.CastY;
+                if (settings.Randomize)
                 {
-                    targetX += rand.Next(-3, 4);
-                    targetY += rand.Next(-3, 4);
+                    targetX += NextRand(-3, 4);
+                    targetY += NextRand(-3, 4);
                 }
 
                 Cursor.Position = new Point(targetX, targetY);
-                Thread.Sleep(80);
+                if (!SleepInterruptibly(80, runId)) break;
 
-                // Hold left-click for 1.10s to hit PERFECT! cast
-                mouse_event(MOUSEEVENTF_LEFTDOWN, 0, 0, 0, 0);
-                int holdMs = (int)(numCastHold.Value * 1000m);
-                if (chkRandomize.Checked)
+                // Hold left-click to hit PERFECT! cast (guarantee LEFTUP even if stopped mid-hold)
+                int holdMs = (int)(settings.CastHoldSec * 1000.0);
+                if (settings.Randomize)
                 {
-                    holdMs += rand.Next(-25, 25);
+                    holdMs += NextRand(-25, 25);
+                    if (holdMs < 150) holdMs = 150;
                 }
-                Thread.Sleep(holdMs);
-                mouse_event(MOUSEEVENTF_LEFTUP, 0, 0, 0, 0);
 
-                Log(string.Format("Casted rod ({0}ms hold). Waiting up to {1}s for bite...", holdMs, numTimeout.Value));
+                mouse_event(MOUSEEVENTF_LEFTDOWN, 0, 0, 0, 0);
+                bool holdCompleted = SleepInterruptibly(holdMs, runId);
+                mouse_event(MOUSEEVENTF_LEFTUP, 0, 0, 0, 0);
+                if (!holdCompleted) break;
+
+                Log(string.Format("Casted rod ({0}ms hold). Waiting up to {1:F2}s for bite...", holdMs, settings.TimeoutSec));
 
                 InvokeAction(delegate {
                     lblStatus.Text = "STATUS: Line in Water - Waiting for Bite...";
@@ -847,34 +1259,39 @@ public class MainForm : Form
                 });
 
                 // Wait 1.0s for bobber to land in water
-                Thread.Sleep(1000);
+                if (!SleepInterruptibly(1000, runId)) break;
 
                 // 3. Bite Waiting Loop
                 DateTime waitStart = DateTime.Now;
-                double maxWaitSec = (double)numTimeout.Value;
+                double maxWaitSec = settings.TimeoutSec;
                 bool biteDetected = false;
 
-                while (isRunning && (DateTime.Now - waitStart).TotalSeconds < maxWaitSec)
+                while (IsActiveRun(runId) && (DateTime.Now - waitStart).TotalSeconds < maxWaitSec)
                 {
                     int redCount;
-                    if (ScanForStopButtonFast(out redCount))
+                    int th;
+                    bool hit1 = ScanForStopButtonFast(out redCount, out th);
+                    UpdateRadarLabel(hit1, redCount, false);
+                    if (hit1)
                     {
-                        Thread.Sleep(25);
-                        if (ScanForStopButtonFast(out redCount))
+                        if (!SleepInterruptibly(25, runId)) break;
+                        bool hit2 = ScanForStopButtonFast(out redCount, out th);
+                        UpdateRadarLabel(hit2, redCount, false);
+                        if (hit2)
                         {
                             biteDetected = true;
                             break;
                         }
                     }
-                    Thread.Sleep(25);
+                    if (!SleepInterruptibly(25, runId)) break;
                 }
 
-                if (!isRunning) break;
+                if (!IsActiveRun(runId)) break;
 
                 // 4. Hook & Reel OR Clean Timeout Reset
                 if (biteDetected)
                 {
-                    ReelInFish();
+                    ReelInFish(settings, runId);
                 }
                 else
                 {
@@ -888,39 +1305,44 @@ public class MainForm : Form
                     Thread.Sleep(50);
                     mouse_event(MOUSEEVENTF_LEFTUP, 0, 0, 0, 0);
 
-                    Thread.Sleep(1300);
+                    SleepInterruptibly(1300, runId);
                 }
             }
             catch (Exception ex)
             {
                 Log("Loop error: " + ex.Message);
-                Thread.Sleep(1000);
+                SleepInterruptibly(1000, runId);
             }
         }
     }
 
-    private void ReelInFish()
+    private void ReelInFish(BotSettings settings, long runId)
     {
         InvokeAction(delegate {
             lblStatus.Text = "STATUS: BITE DETECTED! TURBO REELING!";
             lblStatus.ForeColor = Color.FromArgb(166, 227, 161);
         });
 
-        int clickSpeed = (int)numClickSpeedMs.Value;
-        int maxCap = (int)numClicksCount.Value;
+        int clickSpeed = settings.ClickSpeedMs;
+        int maxCap = settings.MaxClicks;
         int clicksSent = 0;
 
         Log("Bite confirmed! Turbo clicking while STOP button is active...");
 
-        while (isRunning && clicksSent < maxCap)
+        while (IsActiveRun(runId) && clicksSent < maxCap)
         {
             if (clicksSent >= 4)
             {
                 int redCount;
-                if (!ScanForStopButtonFast(out redCount))
+                int th;
+                bool hit1 = ScanForStopButtonFast(out redCount, out th);
+                UpdateRadarLabel(hit1, redCount, false);
+                if (!hit1)
                 {
-                    Thread.Sleep(25);
-                    if (!ScanForStopButtonFast(out redCount))
+                    if (!SleepInterruptibly(25, runId)) break;
+                    bool hit2 = ScanForStopButtonFast(out redCount, out th);
+                    UpdateRadarLabel(hit2, redCount, false);
+                    if (!hit2)
                     {
                         break;
                     }
@@ -930,9 +1352,11 @@ public class MainForm : Form
             mouse_event(MOUSEEVENTF_LEFTDOWN, 0, 0, 0, 0);
             Thread.Sleep(10);
             mouse_event(MOUSEEVENTF_LEFTUP, 0, 0, 0, 0);
-            Thread.Sleep(clickSpeed);
             clicksSent++;
+            if (!SleepInterruptibly(clickSpeed, runId)) break;
         }
+
+        if (!IsActiveRun(runId)) return;
 
         fishCaught++;
         InvokeAction(delegate {
@@ -941,10 +1365,10 @@ public class MainForm : Form
             lblStatus.ForeColor = Color.FromArgb(137, 220, 235);
         });
 
-        int postWaitMs = (int)(numPostCatchWait.Value * 1000m);
+        int postWaitMs = (int)(settings.PostCatchWaitSec * 1000.0);
         Log(string.Format("Caught Fish #{0} in {1} clicks! Waiting {2}ms for popup to finish...", fishCaught, clicksSent, postWaitMs));
 
-        Thread.Sleep(postWaitMs);
+        SleepInterruptibly(postWaitMs, runId);
     }
 
     private void SimulateKeyPress(byte vk, int holdMs)
@@ -957,7 +1381,9 @@ public class MainForm : Form
     private byte GetVirtualKey(string text, byte fallback)
     {
         if (string.IsNullOrEmpty(text)) return fallback;
-        char c = char.ToUpper(text.Trim()[0]);
+        string trimmed = text.Trim();
+        if (trimmed.Length == 0) return fallback;
+        char c = char.ToUpper(trimmed[0]);
         if (c >= '0' && c <= '9') return (byte)(0x30 + (c - '0'));
         if (c >= 'A' && c <= 'Z') return (byte)(0x41 + (c - 'A'));
         return fallback;
@@ -966,7 +1392,16 @@ public class MainForm : Form
     private void InvokeAction(Action act)
     {
         if (this.IsDisposed || !this.IsHandleCreated) return;
-        this.BeginInvoke(act);
+        try
+        {
+            this.BeginInvoke(act);
+        }
+        catch (ObjectDisposedException)
+        {
+        }
+        catch (InvalidOperationException)
+        {
+        }
     }
 
     private void Log(string msg)
@@ -981,9 +1416,12 @@ public class MainForm : Form
     // ================= Global Hotkeys =================
     private void RegisterGlobalHotkeys()
     {
-        RegisterHotKey(this.Handle, HOTKEY_ID_F6, 0, VK_F6);
-        RegisterHotKey(this.Handle, HOTKEY_ID_F7, 0, VK_F7);
-        RegisterHotKey(this.Handle, HOTKEY_ID_F8, 0, VK_F8);
+        if (!RegisterHotKey(this.Handle, HOTKEY_ID_F6, 0, VK_F6))
+            Log("Warning: Could not register global hotkey F6 (already in use by another app).");
+        if (!RegisterHotKey(this.Handle, HOTKEY_ID_F7, 0, VK_F7))
+            Log("Warning: Could not register global hotkey F7 (already in use by another app).");
+        if (!RegisterHotKey(this.Handle, HOTKEY_ID_F8, 0, VK_F8))
+            Log("Warning: Could not register global hotkey F8 (already in use by another app).");
     }
 
     protected override void WndProc(ref Message m)
@@ -1009,14 +1447,27 @@ public class MainForm : Form
 
     protected override void OnFormClosing(FormClosingEventArgs e)
     {
+        SyncSettingsFromUI(true);
+        lock (stateLock)
+        {
+            _isRunning = false;
+            _activeMode = BotMode.Idle;
+            _runGeneration++;
+        }
+
+        if (uiTimer != null) uiTimer.Stop();
+        if (radarTimer != null) radarTimer.Stop();
+
         UnregisterHotKey(this.Handle, HOTKEY_ID_F6);
         UnregisterHotKey(this.Handle, HOTKEY_ID_F7);
         UnregisterHotKey(this.Handle, HOTKEY_ID_F8);
-        isRunning = false;
-        if (botThread != null && botThread.IsAlive)
+
+        lock (radarLock)
         {
-            botThread.Abort();
+            if (radarGraphics != null) { radarGraphics.Dispose(); radarGraphics = null; }
+            if (radarBmp != null) { radarBmp.Dispose(); radarBmp = null; }
         }
+
         base.OnFormClosing(e);
     }
 
@@ -1024,7 +1475,6 @@ public class MainForm : Form
     public static void Main()
     {
         try { SetProcessDPIAware(); } catch { }
-        Control.CheckForIllegalCrossThreadCalls = false;
         Application.EnableVisualStyles();
         Application.SetCompatibleTextRenderingDefault(false);
         Application.Run(new MainForm());

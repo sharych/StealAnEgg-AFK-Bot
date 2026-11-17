@@ -26,29 +26,60 @@ struct BotSettings {
     var camMaxSec: Int
     var camDragPx: Int
     var camArrowAssist: Bool
+
+    static let defaults = BotSettings(
+        timeoutSec: 9.0,
+        maxClicks: 48,
+        clickSpeedMs: 30,
+        postCatchWaitSec: 2.5,
+        castX: 1138.0,
+        castY: 362.0,
+        castHoldSec: 1.10,
+        enable2xGlitch: true,
+        rodKey: "9",
+        swapKey: "3",
+        randomize: true,
+        enableAntiAfk: true,
+        camMinSec: 45,
+        camMaxSec: 110,
+        camDragPx: 120,
+        camArrowAssist: true
+    )
 }
 
 // MARK: - ScreenCaptureKit STOP Button Radar (macOS 14+)
 @available(macOS 14.0, *)
 final class StopButtonRadar {
-    private let lock = NSLock()
+    private let displayLock = NSLock()
     private var cachedDisplay: SCDisplay?
 
-    func scan(outRedCount: inout Int) -> Bool {
+    private func getCachedDisplay() -> SCDisplay? {
+        displayLock.lock()
+        defer { displayLock.unlock() }
+        return cachedDisplay
+    }
+
+    private func setCachedDisplay(_ display: SCDisplay?) {
+        displayLock.lock()
+        cachedDisplay = display
+        displayLock.unlock()
+    }
+
+    func scan(outRedCount: inout Int, outThreshold: inout Int) -> Bool {
         outRedCount = 0
-        lock.lock()
-        defer { lock.unlock() }
+        outThreshold = 40
 
         let semaphore = DispatchSemaphore(value: 0)
         var detected = false
         var count = 0
+        var threshold = 40
 
         Task.detached { [weak self] in
             defer { semaphore.signal() }
             guard let self = self else { return }
             do {
                 let display: SCDisplay
-                if let cached = self.cachedDisplay {
+                if let cached = self.getCachedDisplay() {
                     display = cached
                 } else {
                     let content = try await SCShareableContent.excludingDesktopWindows(false, onScreenWindowsOnly: true)
@@ -56,7 +87,7 @@ final class StopButtonRadar {
                     guard let found = content.displays.first(where: { $0.displayID == mainID }) ?? content.displays.first else {
                         return
                     }
-                    self.cachedDisplay = found
+                    self.setCachedDisplay(found)
                     display = found
                 }
 
@@ -69,6 +100,8 @@ final class StopButtonRadar {
 
                 let scanW = max(1, Int(maxX - minX))
                 let scanH = max(1, Int(maxY - minY))
+                let sampledPixels = max(1, ((scanW + 2) / 3) * ((scanH + 2) / 3))
+                threshold = min(50, max(18, Int((Double(sampledPixels) * (40.0 / 6912.0)).rounded())))
 
                 let filter = SCContentFilter(display: display, excludingApplications: [], exceptingWindows: [])
                 let config = SCStreamConfiguration()
@@ -80,16 +113,22 @@ final class StopButtonRadar {
 
                 let cgImage = try await SCScreenshotManager.captureImage(contentFilter: filter, configuration: config)
                 count = Self.countRedStopPixels(in: cgImage)
-                detected = (count >= 40)
+                detected = (count >= threshold)
             } catch {
-                self.cachedDisplay = nil
+                self.setCachedDisplay(nil)
                 detected = false
             }
         }
 
         _ = semaphore.wait(timeout: .now() + 1.5)
         outRedCount = count
+        outThreshold = threshold
         return detected
+    }
+
+    func scan(outRedCount: inout Int) -> Bool {
+        var threshold = 40
+        return scan(outRedCount: &outRedCount, outThreshold: &threshold)
     }
 
     private static func countRedStopPixels(in image: CGImage) -> Int {
@@ -163,7 +202,13 @@ private func carbonHotKeyHandler(
 
 // MARK: - Main Application Controller
 @available(macOS 14.0, *)
-final class BotAppController: NSObject, NSApplicationDelegate, NSWindowDelegate {
+final class BotAppController: NSObject, NSApplicationDelegate, NSWindowDelegate, NSTextFieldDelegate {
+    private enum BotMode {
+        case idle
+        case fishing
+        case treadmill
+    }
+
     private var window: NSWindow!
     private let radar = StopButtonRadar()
 
@@ -201,10 +246,31 @@ final class BotAppController: NSObject, NSApplicationDelegate, NSWindowDelegate 
     // State
     private let stateLock = NSLock()
     private var _isRunning = false
+    private var _runGeneration: UInt64 = 0
+    private var _activeMode: BotMode = .idle
+    private var _isTestClicking = false
+
     private var isRunning: Bool {
         get { stateLock.lock(); defer { stateLock.unlock() }; return _isRunning }
-        set { stateLock.lock(); _isRunning = newValue; stateLock.unlock() }
     }
+
+    private var activeMode: BotMode {
+        get { stateLock.lock(); defer { stateLock.unlock() }; return _activeMode }
+    }
+
+    private let settingsLock = NSLock()
+    private var cachedSettings = BotSettings.defaults
+
+    private let radarQueue = DispatchQueue(label: "com.stealanegg.radar", qos: .userInteractive)
+    private let radarBusyLock = NSLock()
+    private var isRadarTimerBusy = false
+    private var lastRadarUiUpdate = Date.distantPast
+
+    private let logDateFormatter: DateFormatter = {
+        let df = DateFormatter()
+        df.dateFormat = "HH:mm:ss"
+        return df
+    }()
 
     private var startTime = Date()
     private var fishCaught = 0
@@ -229,6 +295,8 @@ final class BotAppController: NSObject, NSApplicationDelegate, NSWindowDelegate 
         sharedAppController = self
         setupMenu()
         buildUI()
+        loadSettingsFromDefaults()
+        syncSettingsFromUI(save: false)
         registerGlobalHotkeys()
         startTimers()
         checkPermissionsOnLaunch()
@@ -240,7 +308,15 @@ final class BotAppController: NSObject, NSApplicationDelegate, NSWindowDelegate 
     }
 
     func windowWillClose(_ notification: Notification) {
-        isRunning = false
+        syncSettingsFromUI(save: true)
+        stateLock.lock()
+        _isRunning = false
+        _activeMode = .idle
+        _runGeneration &+= 1
+        stateLock.unlock()
+
+        uiTimer?.invalidate()
+        radarTimer?.invalidate()
         for ref in hotKeyRefs {
             if let r = ref { UnregisterEventHotKey(r) }
         }
@@ -493,6 +569,7 @@ final class BotAppController: NSObject, NSApplicationDelegate, NSWindowDelegate 
         tf.textColor = .white
         tf.isBezeled = true
         tf.font = NSFont.systemFont(ofSize: 12)
+        tf.delegate = self
         return tf
     }
 
@@ -523,7 +600,7 @@ final class BotAppController: NSObject, NSApplicationDelegate, NSWindowDelegate 
     }
 
     private func makeCheckbox(_ title: String, checked: Bool, x: CGFloat, y: CGFloat, w: CGFloat) -> NSButton {
-        let chk = NSButton(checkboxWithTitle: title, target: nil, action: nil)
+        let chk = NSButton(checkboxWithTitle: title, target: self, action: #selector(onSettingChanged))
         chk.frame = NSRect(x: x, y: y, width: w, height: 22)
         chk.state = checked ? .on : .off
         chk.attributedTitle = NSAttributedString(
@@ -533,45 +610,160 @@ final class BotAppController: NSObject, NSApplicationDelegate, NSWindowDelegate 
         return chk
     }
 
-    private func readSettings() -> BotSettings {
-        return DispatchQueue.main.syncIfNeeded {
-            BotSettings(
-                timeoutSec: Double(txtTimeout.stringValue) ?? 9.0,
-                maxClicks: Int(txtMaxClicks.stringValue) ?? 48,
-                clickSpeedMs: Int(txtClickSpeedMs.stringValue) ?? 30,
-                postCatchWaitSec: Double(txtPostCatchWait.stringValue) ?? 2.5,
-                castX: Double(txtCastX.stringValue) ?? 1138.0,
-                castY: Double(txtCastY.stringValue) ?? 362.0,
-                castHoldSec: Double(txtCastHold.stringValue) ?? 1.10,
-                enable2xGlitch: chk2xGlitch.state == .on,
-                rodKey: txtRodKey.stringValue,
-                swapKey: txtSwapKey.stringValue,
-                randomize: chkRandomize.state == .on,
-                enableAntiAfk: chkAntiAfk.state == .on,
-                camMinSec: max(10, Int(txtCamMinSec.stringValue) ?? 45),
-                camMaxSec: max(15, Int(txtCamMaxSec.stringValue) ?? 110),
-                camDragPx: max(30, Int(txtCamDragPx.stringValue) ?? 120),
-                camArrowAssist: chkCamArrowAssist.state == .on
-            )
+    // MARK: - Settings Reading & Persistence
+    private static func parseDouble(_ text: String, fallback: Double, min minVal: Double, max maxVal: Double) -> Double {
+        let normalized = text.trimmingCharacters(in: .whitespacesAndNewlines).replacingOccurrences(of: ",", with: ".")
+        guard let v = Double(normalized), v.isFinite else { return fallback }
+        return Swift.min(maxVal, Swift.max(minVal, v))
+    }
+
+    private static func parseInt(_ text: String, fallback: Int, min minVal: Int, max maxVal: Int) -> Int {
+        let trimmed = text.trimmingCharacters(in: .whitespacesAndNewlines)
+        guard let v = Int(trimmed) else { return fallback }
+        return Swift.min(maxVal, Swift.max(minVal, v))
+    }
+
+    private func readSettingsFromUI() -> BotSettings {
+        let d = BotSettings.defaults
+        return BotSettings(
+            timeoutSec: Self.parseDouble(txtTimeout.stringValue, fallback: d.timeoutSec, min: 1.0, max: 60.0),
+            maxClicks: Self.parseInt(txtMaxClicks.stringValue, fallback: d.maxClicks, min: 1, max: 200),
+            clickSpeedMs: Self.parseInt(txtClickSpeedMs.stringValue, fallback: d.clickSpeedMs, min: 5, max: 500),
+            postCatchWaitSec: Self.parseDouble(txtPostCatchWait.stringValue, fallback: d.postCatchWaitSec, min: 0.5, max: 15.0),
+            castX: Self.parseDouble(txtCastX.stringValue, fallback: d.castX, min: 0.0, max: 10000.0),
+            castY: Self.parseDouble(txtCastY.stringValue, fallback: d.castY, min: 0.0, max: 10000.0),
+            castHoldSec: Self.parseDouble(txtCastHold.stringValue, fallback: d.castHoldSec, min: 0.2, max: 5.0),
+            enable2xGlitch: chk2xGlitch.state == .on,
+            rodKey: txtRodKey.stringValue.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty ? d.rodKey : txtRodKey.stringValue,
+            swapKey: txtSwapKey.stringValue.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty ? d.swapKey : txtSwapKey.stringValue,
+            randomize: chkRandomize.state == .on,
+            enableAntiAfk: chkAntiAfk.state == .on,
+            camMinSec: Self.parseInt(txtCamMinSec.stringValue, fallback: d.camMinSec, min: 10, max: 600),
+            camMaxSec: Self.parseInt(txtCamMaxSec.stringValue, fallback: d.camMaxSec, min: 15, max: 900),
+            camDragPx: Self.parseInt(txtCamDragPx.stringValue, fallback: d.camDragPx, min: 30, max: 400),
+            camArrowAssist: chkCamArrowAssist.state == .on
+        )
+    }
+
+    private func currentSettings() -> BotSettings {
+        settingsLock.lock()
+        defer { settingsLock.unlock() }
+        return cachedSettings
+    }
+
+    private func syncSettingsFromUI(save: Bool) {
+        let s = readSettingsFromUI()
+        settingsLock.lock()
+        cachedSettings = s
+        settingsLock.unlock()
+        if save {
+            saveSettingsToDefaults(s)
         }
+    }
+
+    private func saveSettingsToDefaults(_ s: BotSettings) {
+        let ud = UserDefaults.standard
+        ud.set(s.timeoutSec, forKey: "timeoutSec")
+        ud.set(s.maxClicks, forKey: "maxClicks")
+        ud.set(s.clickSpeedMs, forKey: "clickSpeedMs")
+        ud.set(s.postCatchWaitSec, forKey: "postCatchWaitSec")
+        ud.set(s.castX, forKey: "castX")
+        ud.set(s.castY, forKey: "castY")
+        ud.set(s.castHoldSec, forKey: "castHoldSec")
+        ud.set(s.enable2xGlitch, forKey: "enable2xGlitch")
+        ud.set(s.rodKey, forKey: "rodKey")
+        ud.set(s.swapKey, forKey: "swapKey")
+        ud.set(s.randomize, forKey: "randomize")
+        ud.set(s.enableAntiAfk, forKey: "enableAntiAfk")
+        ud.set(s.camMinSec, forKey: "camMinSec")
+        ud.set(s.camMaxSec, forKey: "camMaxSec")
+        ud.set(s.camDragPx, forKey: "camDragPx")
+        ud.set(s.camArrowAssist, forKey: "camArrowAssist")
+    }
+
+    private func loadSettingsFromDefaults() {
+        let ud = UserDefaults.standard
+        if ud.object(forKey: "timeoutSec") != nil {
+            txtTimeout.stringValue = String(format: "%.2f", Swift.min(60.0, Swift.max(1.0, ud.double(forKey: "timeoutSec"))))
+        }
+        if ud.object(forKey: "maxClicks") != nil {
+            txtMaxClicks.stringValue = "\(Swift.min(200, Swift.max(1, ud.integer(forKey: "maxClicks"))))"
+        }
+        if ud.object(forKey: "clickSpeedMs") != nil {
+            txtClickSpeedMs.stringValue = "\(Swift.min(500, Swift.max(5, ud.integer(forKey: "clickSpeedMs"))))"
+        }
+        if ud.object(forKey: "postCatchWaitSec") != nil {
+            txtPostCatchWait.stringValue = String(format: "%.2f", Swift.min(15.0, Swift.max(0.5, ud.double(forKey: "postCatchWaitSec"))))
+        }
+        if ud.object(forKey: "castX") != nil {
+            txtCastX.stringValue = "\(Int(Swift.max(0.0, ud.double(forKey: "castX"))))"
+        }
+        if ud.object(forKey: "castY") != nil {
+            txtCastY.stringValue = "\(Int(Swift.max(0.0, ud.double(forKey: "castY"))))"
+        }
+        if ud.object(forKey: "castHoldSec") != nil {
+            txtCastHold.stringValue = String(format: "%.2f", Swift.min(5.0, Swift.max(0.2, ud.double(forKey: "castHoldSec"))))
+        }
+        if ud.object(forKey: "enable2xGlitch") != nil {
+            chk2xGlitch.state = ud.bool(forKey: "enable2xGlitch") ? .on : .off
+        }
+        if let rk = ud.string(forKey: "rodKey"), !rk.isEmpty { txtRodKey.stringValue = rk }
+        if let sk = ud.string(forKey: "swapKey"), !sk.isEmpty { txtSwapKey.stringValue = sk }
+        if ud.object(forKey: "randomize") != nil {
+            chkRandomize.state = ud.bool(forKey: "randomize") ? .on : .off
+        }
+        if ud.object(forKey: "enableAntiAfk") != nil {
+            chkAntiAfk.state = ud.bool(forKey: "enableAntiAfk") ? .on : .off
+        }
+        if ud.object(forKey: "camMinSec") != nil {
+            txtCamMinSec.stringValue = "\(Swift.min(600, Swift.max(10, ud.integer(forKey: "camMinSec"))))"
+        }
+        if ud.object(forKey: "camMaxSec") != nil {
+            txtCamMaxSec.stringValue = "\(Swift.min(900, Swift.max(15, ud.integer(forKey: "camMaxSec"))))"
+        }
+        if ud.object(forKey: "camDragPx") != nil {
+            txtCamDragPx.stringValue = "\(Swift.min(400, Swift.max(30, ud.integer(forKey: "camDragPx"))))"
+        }
+        if ud.object(forKey: "camArrowAssist") != nil {
+            chkCamArrowAssist.state = ud.bool(forKey: "camArrowAssist") ? .on : .off
+        }
+    }
+
+    func controlTextDidChange(_ obj: Notification) {
+        syncSettingsFromUI(save: true)
+    }
+
+    func controlTextDidEndEditing(_ obj: Notification) {
+        syncSettingsFromUI(save: true)
+    }
+
+    @objc private func onSettingChanged() {
+        syncSettingsFromUI(save: true)
     }
 
     // MARK: - Actions & Hotkeys
     private func registerGlobalHotkeys() {
         var eventSpec = EventTypeSpec(eventClass: OSType(kEventClassKeyboard), eventKind: UInt32(kEventHotKeyPressed))
-        InstallEventHandler(GetApplicationEventTarget(), carbonHotKeyHandler, 1, &eventSpec, nil, nil)
+        let handlerStatus = InstallEventHandler(GetApplicationEventTarget(), carbonHotKeyHandler, 1, &eventSpec, nil, nil)
+        if handlerStatus != noErr {
+            log("⚠️ Failed to install global hotkey handler (OSStatus \(handlerStatus)).")
+        }
 
         let sig: OSType = 0x53414547 // 'SAEG'
-        let mappings: [(UInt32, UInt32)] = [
-            (1, UInt32(kVK_F6)),
-            (2, UInt32(kVK_F7)),
-            (3, UInt32(kVK_F8))
+        let mappings: [(UInt32, UInt32, String)] = [
+            (1, UInt32(kVK_F6), "F6"),
+            (2, UInt32(kVK_F7), "F7"),
+            (3, UInt32(kVK_F8), "F8")
         ]
-        for (id, vk) in mappings {
+        for (id, vk, label) in mappings {
             var ref: EventHotKeyRef?
             let hkID = EventHotKeyID(signature: sig, id: id)
-            RegisterEventHotKey(vk, 0, hkID, GetApplicationEventTarget(), 0, &ref)
-            hotKeyRefs.append(ref)
+            let status = RegisterEventHotKey(vk, 0, hkID, GetApplicationEventTarget(), 0, &ref)
+            if status != noErr {
+                log("⚠️ Could not register global hotkey \(label) (OSStatus \(status)). Another app may already be using it.")
+            } else {
+                hotKeyRefs.append(ref)
+            }
         }
     }
 
@@ -587,18 +779,41 @@ final class BotAppController: NSObject, NSApplicationDelegate, NSWindowDelegate 
 
         radarTimer = Timer.scheduledTimer(withTimeInterval: 0.35, repeats: true) { [weak self] _ in
             guard let self = self else { return }
-            DispatchQueue.global(qos: .userInteractive).async {
+            if self.activeMode == .fishing { return }
+
+            self.radarBusyLock.lock()
+            if self.isRadarTimerBusy {
+                self.radarBusyLock.unlock()
+                return
+            }
+            self.isRadarTimerBusy = true
+            self.radarBusyLock.unlock()
+
+            self.radarQueue.async { [weak self] in
+                guard let self = self else { return }
+                defer {
+                    self.radarBusyLock.lock()
+                    self.isRadarTimerBusy = false
+                    self.radarBusyLock.unlock()
+                }
                 var red = 0
                 let isBite = self.radar.scan(outRedCount: &red)
-                DispatchQueue.main.async {
-                    if isBite {
-                        self.lblRadar.stringValue = "Radar Status: [MINIGAME STOP BUTTON DETECTED! (\(red) red px)]"
-                        self.lblRadar.textColor = self.colGreen
-                    } else {
-                        self.lblRadar.stringValue = "Radar Status: Waiting for bite (\(red) red px in scan zone)"
-                        self.lblRadar.textColor = self.colTeal
-                    }
-                }
+                self.updateRadarLabel(detected: isBite, redCount: red, force: true)
+            }
+        }
+    }
+
+    private func updateRadarLabel(detected: Bool, redCount: Int, force: Bool = false) {
+        let now = Date()
+        if !force && now.timeIntervalSince(lastRadarUiUpdate) < 0.25 { return }
+        lastRadarUiUpdate = now
+        DispatchQueue.main.async {
+            if detected {
+                self.lblRadar.stringValue = "Radar Status: [MINIGAME STOP BUTTON DETECTED! (\(redCount) red px)]"
+                self.lblRadar.textColor = self.colGreen
+            } else {
+                self.lblRadar.stringValue = "Radar Status: Waiting for bite (\(redCount) red px in scan zone)"
+                self.lblRadar.textColor = self.colTeal
             }
         }
     }
@@ -609,15 +824,21 @@ final class BotAppController: NSObject, NSApplicationDelegate, NSWindowDelegate 
     @objc private func onTestClicks() { doTurboClickTest() }
 
     @objc private func onTestRadar() {
-        var red = 0
-        let detected = radar.scan(outRedCount: &red)
-        let bounds = CGDisplayBounds(CGMainDisplayID())
-        let msg = "STOP Button Detected: \(detected ? "YES (Minigame Active)" : "NO (Waiting)")\nRed Pixels: \(red) (Threshold: 40)\nDisplay Points: \(Int(bounds.width))x\(Int(bounds.height))"
-        log(msg.replacingOccurrences(of: "\n", with: " | "))
-        let alert = NSAlert()
-        alert.messageText = "Radar Test"
-        alert.informativeText = msg
-        alert.runModal()
+        radarQueue.async { [weak self] in
+            guard let self = self else { return }
+            var red = 0
+            var threshold = 40
+            let detected = self.radar.scan(outRedCount: &red, outThreshold: &threshold)
+            let bounds = CGDisplayBounds(CGMainDisplayID())
+            let msg = "STOP Button Detected: \(detected ? "YES (Minigame Active)" : "NO (Waiting)")\nRed Pixels: \(red) (Threshold: \(threshold))\nDisplay Points: \(Int(bounds.width))x\(Int(bounds.height))"
+            self.log(msg.replacingOccurrences(of: "\n", with: " | "))
+            DispatchQueue.main.async {
+                let alert = NSAlert()
+                alert.messageText = "Radar Test"
+                alert.informativeText = msg
+                alert.runModal()
+            }
+        }
     }
 
     @objc private func onPickPoint() {
@@ -627,17 +848,19 @@ final class BotAppController: NSObject, NSApplicationDelegate, NSWindowDelegate 
             let loc = CGEvent(source: nil)?.location ?? .zero
             self.txtCastX.stringValue = "\(Int(loc.x))"
             self.txtCastY.stringValue = "\(Int(loc.y))"
+            self.syncSettingsFromUI(save: true)
             NSSound.beep()
-            self.log("Picked Cast Target: X=\(Int(loc.x)), Y=\(Int(loc.y))")
+            self.log("Picked Cast Target: X=\(Int(loc.x)), Y=\(Int(loc.y)) (Saved)")
         }
     }
 
     @objc private func onTestCamRotate() {
         log("Switch to Roblox! Testing smooth camera rotation in 2 seconds...")
-        let settings = readSettings()
+        syncSettingsFromUI(save: true)
+        let settings = currentSettings()
         Thread {
             Thread.sleep(forTimeInterval: 2.0)
-            self.performSmoothCameraRotate(settings: settings)
+            self.performSmoothCameraRotate(settings: settings, runId: nil)
         }.start()
     }
 
@@ -649,43 +872,80 @@ final class BotAppController: NSObject, NSApplicationDelegate, NSWindowDelegate 
         if isRunning { stopAllBots() } else { startTreadmillBot() }
     }
 
+    private func beginRun(mode: BotMode) -> UInt64? {
+        stateLock.lock()
+        defer { stateLock.unlock() }
+        guard !_isRunning else { return nil }
+        _isRunning = true
+        _activeMode = mode
+        _runGeneration &+= 1
+        return _runGeneration
+    }
+
+    private func isActiveRun(_ runId: UInt64) -> Bool {
+        stateLock.lock()
+        defer { stateLock.unlock() }
+        return _isRunning && _runGeneration == runId
+    }
+
+    private func sleepInterruptibly(_ seconds: Double, runId: UInt64) -> Bool {
+        if seconds <= 0 { return isActiveRun(runId) }
+        let deadline = Date().addingTimeInterval(seconds)
+        while isActiveRun(runId) {
+            let remaining = deadline.timeIntervalSinceNow
+            if remaining <= 0 { return true }
+            Thread.sleep(forTimeInterval: Swift.min(0.04, remaining))
+        }
+        return false
+    }
+
     private func startFishingBot() {
-        guard !isRunning else { return }
-        isRunning = true
+        syncSettingsFromUI(save: true)
+        guard let runId = beginRun(mode: .fishing) else { return }
+
         startTime = Date()
         setButtonStyle(btnToggleFishing, title: "STOP FISHING (F6)", bg: colRed, fg: .black)
         btnToggleTreadmill.isEnabled = false
+        lblFishCount.stringValue = "Fish Caught: \(fishCaught)"
         lblStatus.stringValue = "STATUS: FISHING RUNNING (Press F6 to Stop)"
         lblStatus.textColor = colGreen
         log("Fishing Bot STARTED! Casting in 1.5s...")
         NSSound.beep()
 
-        let settings = readSettings()
-        let t = Thread { [weak self] in self?.fishingLoop(settings: settings) }
+        let t = Thread { [weak self] in self?.fishingLoop(runId: runId) }
         workerThread = t
         t.start()
     }
 
     private func startTreadmillBot() {
-        guard !isRunning else { return }
-        isRunning = true
+        syncSettingsFromUI(save: true)
+        guard let runId = beginRun(mode: .treadmill) else { return }
+
         startTime = Date()
         setButtonStyle(btnToggleTreadmill, title: "STOP TREADMILL (F8)", bg: colRed, fg: .black)
         btnToggleFishing.isEnabled = false
+        lblFishCount.stringValue = "Cam Rotates: \(camRotationsDone)"
         lblStatus.stringValue = "STATUS: TREADMILL AFK RUNNING (Press F8 to Stop)"
         lblStatus.textColor = colBlue
         log("Treadmill Speed AFK Mode STARTED! Stand on treadmill in Roblox.")
         NSSound.beep()
 
-        let settings = readSettings()
-        let t = Thread { [weak self] in self?.treadmillLoop(settings: settings) }
+        let t = Thread { [weak self] in self?.treadmillLoop(runId: runId) }
         workerThread = t
         t.start()
     }
 
     private func stopAllBots() {
-        guard isRunning else { return }
-        isRunning = false
+        stateLock.lock()
+        guard _isRunning else {
+            stateLock.unlock()
+            return
+        }
+        _isRunning = false
+        _activeMode = .idle
+        _runGeneration &+= 1
+        stateLock.unlock()
+
         setButtonStyle(btnToggleFishing, title: "START FISHING (F6)", bg: colGreen, fg: .black)
         btnToggleFishing.isEnabled = true
         setButtonStyle(btnToggleTreadmill, title: "TREADMILL AFK (F8)", bg: colBlue, fg: .black)
@@ -697,8 +957,23 @@ final class BotAppController: NSObject, NSApplicationDelegate, NSWindowDelegate 
     }
 
     func doTurboClickTest() {
+        stateLock.lock()
+        if _isTestClicking {
+            stateLock.unlock()
+            return
+        }
+        _isTestClicking = true
+        stateLock.unlock()
+
         log("Sending 20 TURBO clicks instantly right now!")
-        Thread {
+        Thread { [weak self] in
+            defer {
+                if let self = self {
+                    self.stateLock.lock()
+                    self._isTestClicking = false
+                    self.stateLock.unlock()
+                }
+            }
             let pt = CGEvent(source: nil)?.location ?? .zero
             for _ in 0..<20 {
                 Self.postLeftMouse(down: true, at: pt)
@@ -708,68 +983,74 @@ final class BotAppController: NSObject, NSApplicationDelegate, NSWindowDelegate 
             }
             DispatchQueue.main.async {
                 NSSound.beep()
-                self.log("20 Turbo clicks finished!")
+                self?.log("20 Turbo clicks finished!")
             }
         }.start()
     }
 
     // MARK: - Bot Loops
-    private func treadmillLoop(settings: BotSettings) {
-        Thread.sleep(forTimeInterval: 2.0)
-        if isRunning {
+    private func treadmillLoop(runId: UInt64) {
+        guard sleepInterruptibly(2.0, runId: runId) else { return }
+        if isActiveRun(runId) {
             setStatus("STATUS: Treadmill Mode - Rotating Camera...", color: colGreen)
-            performSmoothCameraRotate(settings: settings)
+            performSmoothCameraRotate(settings: currentSettings(), runId: runId)
             updateCountLabel("Cam Rotates: \(camRotationsDone)")
         }
 
-        while isRunning {
+        while isActiveRun(runId) {
+            let settings = currentSettings()
             let maxS = max(settings.camMinSec, settings.camMaxSec)
             let waitSec = Int.random(in: settings.camMinSec...maxS)
             log("Staying on treadmill (zero WASD). Next camera rotate in \(waitSec)s...")
 
             let target = Date().addingTimeInterval(TimeInterval(waitSec))
-            while isRunning && Date() < target {
+            while isActiveRun(runId) && Date() < target {
                 let rem = max(0, Int(ceil(target.timeIntervalSinceNow)))
                 setStatus("STATUS: TREADMILL AFK (Next Camera Rotate in \(rem)s)", color: colBlue)
-                Thread.sleep(forTimeInterval: 0.5)
+                _ = sleepInterruptibly(0.5, runId: runId)
             }
-            if !isRunning { break }
+            guard isActiveRun(runId) else { break }
 
             setStatus("STATUS: Treadmill Mode - Rotating Camera...", color: colGreen)
-            performSmoothCameraRotate(settings: settings)
+            performSmoothCameraRotate(settings: currentSettings(), runId: runId)
             updateCountLabel("Cam Rotates: \(camRotationsDone)")
         }
     }
 
-    private func fishingLoop(settings: BotSettings) {
-        Thread.sleep(forTimeInterval: 1.5)
-        var nextCamAt = Date().addingTimeInterval(TimeInterval(randomCamInterval(settings)))
+    private func fishingLoop(runId: UInt64) {
+        guard sleepInterruptibly(1.5, runId: runId) else { return }
+        var nextCamAt = Date().addingTimeInterval(TimeInterval(randomCamInterval(currentSettings())))
 
-        while isRunning {
+        while isActiveRun(runId) {
+            let settings = currentSettings()
+
             var initialRed = 0
-            if radar.scan(outRedCount: &initialRed) {
-                reelInFish(settings: settings)
+            let initialDetected = radar.scan(outRedCount: &initialRed)
+            updateRadarLabel(detected: initialDetected, redCount: initialRed)
+            if initialDetected {
+                let defaultPt = CGPoint(x: settings.castX, y: settings.castY)
+                reelInFish(settings: settings, clickPt: defaultPt, runId: runId)
                 continue
             }
 
             if settings.enableAntiAfk && Date() >= nextCamAt {
                 setStatus("STATUS: Anti-AFK Smooth Camera Rotate...", color: colTeal)
-                performSmoothCameraRotate(settings: settings)
+                performSmoothCameraRotate(settings: settings, runId: runId)
                 nextCamAt = Date().addingTimeInterval(TimeInterval(randomCamInterval(settings)))
-                Thread.sleep(forTimeInterval: 0.35)
+                guard sleepInterruptibly(0.35, runId: runId) else { break }
             }
-            if !isRunning { break }
+            guard isActiveRun(runId) else { break }
 
-            setStatus("STATUS: Charging Cast (1.10s)...", color: fgText)
+            setStatus(String(format: "STATUS: Charging Cast (%.2fs)...", settings.castHoldSec), color: fgText)
             if settings.enable2xGlitch {
                 let rodVK = keyCode(for: settings.rodKey, fallback: UInt16(kVK_ANSI_9))
                 let swapVK = keyCode(for: settings.swapKey, fallback: UInt16(kVK_ANSI_3))
                 Self.pressKey(rodVK, holdMs: 50)
-                Thread.sleep(forTimeInterval: 0.15)
+                guard sleepInterruptibly(0.15, runId: runId) else { break }
                 Self.pressKey(swapVK, holdMs: 50)
-                Thread.sleep(forTimeInterval: 1.45)
+                guard sleepInterruptibly(1.45, runId: runId) else { break }
             }
-            if !isRunning { break }
+            guard isActiveRun(runId) else { break }
 
             var aimX = settings.castX
             var aimY = settings.castY
@@ -779,85 +1060,107 @@ final class BotAppController: NSObject, NSApplicationDelegate, NSWindowDelegate 
             }
             let aimPt = CGPoint(x: aimX, y: aimY)
             CGWarpMouseCursorPosition(aimPt)
-            Thread.sleep(forTimeInterval: 0.08)
+            guard sleepInterruptibly(0.08, runId: runId) else { break }
 
             var holdMs = Int(settings.castHoldSec * 1000.0)
-            if settings.randomize { holdMs += Int.random(in: -25...25) }
+            if settings.randomize { holdMs = max(150, holdMs + Int.random(in: -25...25)) }
 
             Self.postLeftMouse(down: true, at: aimPt)
-            Thread.sleep(forTimeInterval: Double(holdMs) / 1000.0)
+            let holdCompleted = sleepInterruptibly(Double(holdMs) / 1000.0, runId: runId)
             Self.postLeftMouse(down: false, at: aimPt)
+            guard holdCompleted else { break }
 
-            log("Casted rod (\(holdMs)ms hold). Waiting up to \(settings.timeoutSec)s for bite...")
+            log("Casted rod (\(holdMs)ms hold). Waiting up to \(String(format: "%.2f", settings.timeoutSec))s for bite...")
             setStatus("STATUS: Line in Water - Waiting for Bite...", color: colYellow)
-            Thread.sleep(forTimeInterval: 1.0)
+            guard sleepInterruptibly(1.0, runId: runId) else { break }
 
             let waitStart = Date()
             var biteDetected = false
-            while isRunning && Date().timeIntervalSince(waitStart) < settings.timeoutSec {
+            while isActiveRun(runId) && Date().timeIntervalSince(waitStart) < settings.timeoutSec {
                 var r = 0
-                if radar.scan(outRedCount: &r) {
-                    Thread.sleep(forTimeInterval: 0.025)
-                    if radar.scan(outRedCount: &r) {
+                let hit1 = radar.scan(outRedCount: &r)
+                updateRadarLabel(detected: hit1, redCount: r)
+                if hit1 {
+                    guard sleepInterruptibly(0.025, runId: runId) else { break }
+                    let hit2 = radar.scan(outRedCount: &r)
+                    updateRadarLabel(detected: hit2, redCount: r)
+                    if hit2 {
                         biteDetected = true
                         break
                     }
                 }
-                Thread.sleep(forTimeInterval: 0.025)
+                guard sleepInterruptibly(0.025, runId: runId) else { break }
             }
-            if !isRunning { break }
+            guard isActiveRun(runId) else { break }
 
             if biteDetected {
-                reelInFish(settings: settings)
+                reelInFish(settings: settings, clickPt: aimPt, runId: runId)
             } else {
                 log("No bite after timeout. Pulling bobber out of water to reset...")
                 setStatus("STATUS: Resetting Line...", color: colRed)
                 Self.postLeftMouse(down: true, at: aimPt)
                 Thread.sleep(forTimeInterval: 0.05)
                 Self.postLeftMouse(down: false, at: aimPt)
-                Thread.sleep(forTimeInterval: 1.3)
+                _ = sleepInterruptibly(1.3, runId: runId)
             }
         }
     }
 
-    private func reelInFish(settings: BotSettings) {
+    private func reelInFish(settings: BotSettings, clickPt: CGPoint, runId: UInt64) {
         setStatus("STATUS: BITE DETECTED! TURBO REELING!", color: colGreen)
         log("Bite confirmed! Turbo clicking while STOP button is active...")
 
         var clicks = 0
-        let clickPt = CGPoint(x: settings.castX, y: settings.castY)
-        while isRunning && clicks < settings.maxClicks {
+        while isActiveRun(runId) && clicks < settings.maxClicks {
             if clicks >= 4 {
                 var r = 0
-                if !radar.scan(outRedCount: &r) {
-                    Thread.sleep(forTimeInterval: 0.025)
-                    if !radar.scan(outRedCount: &r) { break }
+                let hit1 = radar.scan(outRedCount: &r)
+                updateRadarLabel(detected: hit1, redCount: r)
+                if !hit1 {
+                    guard sleepInterruptibly(0.025, runId: runId) else { break }
+                    let hit2 = radar.scan(outRedCount: &r)
+                    updateRadarLabel(detected: hit2, redCount: r)
+                    if !hit2 { break }
                 }
             }
             Self.postLeftMouse(down: true, at: clickPt)
             Thread.sleep(forTimeInterval: 0.010)
             Self.postLeftMouse(down: false, at: clickPt)
-            Thread.sleep(forTimeInterval: Double(settings.clickSpeedMs) / 1000.0)
             clicks += 1
+            guard sleepInterruptibly(Double(settings.clickSpeedMs) / 1000.0, runId: runId) else { break }
         }
+
+        guard isActiveRun(runId) else { return }
 
         fishCaught += 1
         updateCountLabel("Fish Caught: \(fishCaught)")
         setStatus("STATUS: Fish Caught! Waiting for reward popup...", color: colTeal)
         let waitMs = Int(settings.postCatchWaitSec * 1000.0)
         log("Caught Fish #\(fishCaught) in \(clicks) clicks! Waiting \(waitMs)ms...")
-        Thread.sleep(forTimeInterval: Double(waitMs) / 1000.0)
+        _ = sleepInterruptibly(settings.postCatchWaitSec, runId: runId)
     }
 
     // MARK: - Smooth Right-Click Camera Rotate
-    private func performSmoothCameraRotate(settings: BotSettings) {
+    private func performSmoothCameraRotate(settings: BotSettings, runId: UInt64?) {
+        let shouldContinue: () -> Bool = {
+            if let id = runId { return self.isActiveRun(id) }
+            return true
+        }
+        let pauseStep: (Double) -> Bool = { secs in
+            if let id = runId { return self.sleepInterruptibly(secs, runId: id) }
+            Thread.sleep(forTimeInterval: secs)
+            return true
+        }
+
+        guard shouldContinue() else { return }
+
         let bounds = CGDisplayBounds(CGMainDisplayID())
         let startX = bounds.midX + Double(Int.random(in: -35...35))
         let startY = bounds.height * 0.38 + Double(Int.random(in: -20...20))
         var curPt = CGPoint(x: startX, y: startY)
 
         CGWarpMouseCursorPosition(curPt)
-        Thread.sleep(forTimeInterval: 0.06)
+        guard pauseStep(0.06) else { return }
 
         var totalPx = settings.camDragPx
         if settings.randomize {
@@ -869,18 +1172,30 @@ final class BotAppController: NSObject, NSApplicationDelegate, NSWindowDelegate 
         let stepDy = Double(Int.random(in: -1...1))
 
         Self.postRightMouse(type: .rightMouseDown, at: curPt, dx: 0, dy: 0)
-        Thread.sleep(forTimeInterval: 0.055)
+        var rightDown = true
+        defer {
+            if rightDown {
+                Self.postRightMouse(type: .rightMouseUp, at: curPt, dx: 0, dy: 0)
+            }
+        }
 
+        guard pauseStep(0.055) else { return }
+
+        var walkedSteps = 0
         for _ in 0..<steps {
+            guard shouldContinue() else { break }
             curPt.x += stepDx
             curPt.y += stepDy
             Self.postRightMouse(type: .rightMouseDragged, at: curPt, dx: Int64(stepDx), dy: Int64(stepDy))
-            Thread.sleep(forTimeInterval: 0.014)
+            walkedSteps += 1
+            if !pauseStep(0.014) { break }
         }
 
-        Thread.sleep(forTimeInterval: Double(Int.random(in: 120...250)) / 1000.0)
+        if shouldContinue() {
+            _ = pauseStep(Double(Int.random(in: 120...250)) / 1000.0)
+        }
 
-        for _ in 0..<steps {
+        for _ in 0..<walkedSteps {
             curPt.x -= stepDx
             curPt.y -= stepDy
             Self.postRightMouse(type: .rightMouseDragged, at: curPt, dx: Int64(-stepDx), dy: Int64(-stepDy))
@@ -889,14 +1204,17 @@ final class BotAppController: NSObject, NSApplicationDelegate, NSWindowDelegate 
 
         Thread.sleep(forTimeInterval: 0.045)
         Self.postRightMouse(type: .rightMouseUp, at: curPt, dx: 0, dy: 0)
+        rightDown = false
+
+        guard shouldContinue() else { return }
 
         if settings.camArrowAssist {
-            Thread.sleep(forTimeInterval: 0.08)
+            guard pauseStep(0.08) else { return }
             let first = dir > 0 ? UInt16(kVK_RightArrow) : UInt16(kVK_LeftArrow)
             let second = dir > 0 ? UInt16(kVK_LeftArrow) : UInt16(kVK_RightArrow)
             let hold = Int.random(in: 85...140)
             Self.pressKey(first, holdMs: hold)
-            Thread.sleep(forTimeInterval: 0.09)
+            guard pauseStep(0.09) else { return }
             Self.pressKey(second, holdMs: hold)
         }
 
@@ -934,7 +1252,12 @@ final class BotAppController: NSObject, NSApplicationDelegate, NSWindowDelegate 
         let map: [Character: Int] = [
             "0": kVK_ANSI_0, "1": kVK_ANSI_1, "2": kVK_ANSI_2, "3": kVK_ANSI_3, "4": kVK_ANSI_4,
             "5": kVK_ANSI_5, "6": kVK_ANSI_6, "7": kVK_ANSI_7, "8": kVK_ANSI_8, "9": kVK_ANSI_9,
-            "A": kVK_ANSI_A, "D": kVK_ANSI_D, "E": kVK_ANSI_E, "W": kVK_ANSI_W, "S": kVK_ANSI_S
+            "A": kVK_ANSI_A, "B": kVK_ANSI_B, "C": kVK_ANSI_C, "D": kVK_ANSI_D, "E": kVK_ANSI_E,
+            "F": kVK_ANSI_F, "G": kVK_ANSI_G, "H": kVK_ANSI_H, "I": kVK_ANSI_I, "J": kVK_ANSI_J,
+            "K": kVK_ANSI_K, "L": kVK_ANSI_L, "M": kVK_ANSI_M, "N": kVK_ANSI_N, "O": kVK_ANSI_O,
+            "P": kVK_ANSI_P, "Q": kVK_ANSI_Q, "R": kVK_ANSI_R, "S": kVK_ANSI_S, "T": kVK_ANSI_T,
+            "U": kVK_ANSI_U, "V": kVK_ANSI_V, "W": kVK_ANSI_W, "X": kVK_ANSI_X, "Y": kVK_ANSI_Y,
+            "Z": kVK_ANSI_Z
         ]
         if let code = map[ch] { return UInt16(code) }
         return fallback
@@ -955,20 +1278,19 @@ final class BotAppController: NSObject, NSApplicationDelegate, NSWindowDelegate 
     }
 
     private func log(_ message: String) {
-        let df = DateFormatter()
-        df.dateFormat = "HH:mm:ss"
-        let line = "[\(df.string(from: Date()))] \(message)\n"
+        let line = "[\(logDateFormatter.string(from: Date()))] \(message)\n"
         DispatchQueue.main.async {
-            self.txtLog.string += line
+            guard let storage = self.txtLog.textStorage else { return }
+            if storage.length > 12000 {
+                storage.deleteCharacters(in: NSRange(location: 0, length: storage.length - 6000))
+            }
+            let attrs: [NSAttributedString.Key: Any] = [
+                .foregroundColor: self.colGreen,
+                .font: self.txtLog.font ?? NSFont.monospacedSystemFont(ofSize: 11, weight: .regular)
+            ]
+            storage.append(NSAttributedString(string: line, attributes: attrs))
             self.txtLog.scrollToEndOfDocument(nil)
         }
-    }
-}
-
-private extension DispatchQueue {
-    func syncIfNeeded<T>(_ block: () -> T) -> T {
-        if Thread.isMainThread { return block() }
-        return DispatchQueue.main.sync(execute: block)
     }
 }
 
